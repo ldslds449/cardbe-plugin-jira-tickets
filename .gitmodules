@@ -1,0 +1,3 @@
+[submodule "cardbe-plugin-api"]
+	path = cardbe-plugin-api
+	url = https://github.com/ldslds449/cardbe-plugin-api
