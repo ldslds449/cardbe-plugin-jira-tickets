@@ -8,7 +8,7 @@
     "en": "Import Jira tickets using custom JQL; create missing status columns automatically.",
     "zh-TW": "使用自訂 JQL 匯入 Jira 工作項目，自動建立缺少的狀態欄位。"
   },
-  "version": "1.0.0",
+  "version": "1.0.1",
   "api_version": "1.0.0",
   "storage_schema_version": 1,
   "domains": [
@@ -37,29 +37,38 @@
     {
       "key": "api",
       "description": {
-        "en": "Choose Cloud for Jira Cloud REST v3, or Data Center for Jira Data Center REST v2.",
-        "zh-TW": "Jira Cloud 使用 REST v3；Jira Data Center 使用 REST v2。請選擇你的 Jira 類型。"
+        "en": "Self-hosted Jira Server/Data Center uses PAT with REST v2 (default). Jira Cloud uses OAuth with REST v3.",
+        "zh-TW": "自架 Jira Server／Data Center 使用 PAT 與 REST v2（預設）；Jira Cloud 使用 OAuth 與 REST v3。"
       },
-      "label": "Jira API",
+      "label": {
+        "zh-TW": "Jira API",
+        "en": "Jira API"
+      },
       "type": "select",
       "required": true,
-      "default": "cloud",
+      "default": "data-center",
       "options": [
         {
-          "value": "cloud",
-          "label": "Jira Cloud (OAuth bearer token)"
+          "value": "data-center",
+          "label": {
+            "en": "Self-hosted Jira (PAT, REST v2)",
+            "zh-TW": "自架 Jira（PAT、REST v2）"
+          }
         },
         {
-          "value": "data-center",
-          "label": "Jira Data Center (PAT)"
+          "value": "cloud",
+          "label": {
+            "zh-TW": "Jira Cloud REST v3（OAuth Bearer 權杖）",
+            "en": "Jira Cloud REST v3 (OAuth bearer token)"
+          }
         }
       ]
     },
     {
       "key": "base_url",
       "description": {
-        "en": "HTTPS API base URL, without /rest/api. Cloud: https://api.atlassian.com/ex/jira/<cloudId>. Data Center: https://jira.example.com, including any context path. Access requires host approval. Bearer credentials are sent only to the manifest domain, never to a custom host.",
-        "zh-TW": "HTTPS API 基底網址，不含 /rest/api。Cloud 範例：https://api.atlassian.com/ex/jira/<cloudId>；Data Center 範例：https://jira.example.com，可包含站台路徑。連線需要核准主機；Bearer 憑證僅傳送至 manifest 宣告的網域，不會傳送至自訂主機。"
+        "en": "HTTPS API base URL without /rest/api. Self-hosted: https://jira.example.com, including any /jira context path. Cloud: https://api.atlassian.com/ex/jira/<cloudId>. Approve its host separately; the token is scoped to /rest/api/2 and /rest/api/3 beneath this URL.",
+        "zh-TW": "HTTPS API 基底網址，不含 /rest/api。自架：https://jira.example.com，請包含 /jira 等站台路徑。Cloud：https://api.atlassian.com/ex/jira/<cloudId>。需另外核准主機；權杖僅傳送至此網址下的 /rest/api/2 與 /rest/api/3。"
       },
       "label": {
         "en": "API base URL",
@@ -71,8 +80,8 @@
     {
       "key": "site_url",
       "description": {
-        "en": "HTTPS Jira site URL used for ticket links and stable identities, for example https://your-team.atlassian.net. Include any context path and keep this value stable between syncs.",
-        "zh-TW": "用於工作項目連結與識別的 HTTPS Jira 站台網址，例如 https://your-team.atlassian.net。請包含站台路徑，並在各次同步間維持相同網址。"
+        "en": "HTTPS Jira site URL used for links and stable identities. Self-hosted: same as API base URL, including any context path. Cloud: https://your-team.atlassian.net. Keep this value stable between syncs.",
+        "zh-TW": "用於連結與識別的 HTTPS Jira 站台網址。自架：與 API 基底網址相同，包含站台路徑；Cloud：https://your-team.atlassian.net。請在各次同步間維持相同網址。"
       },
       "label": {
         "en": "Jira site URL (ticket links)",
@@ -108,15 +117,33 @@
     {
       "key": "token",
       "description": {
-        "en": "Cloud requires an OAuth access token; Data Center requires a personal access token. Email plus API token (Basic auth) is unsupported. Cardbe sends Bearer credentials only to the sole manifest domain when it is the only approved host; custom hosts do not receive credentials.",
-        "zh-TW": "Cloud 使用 OAuth 存取權杖；Data Center 使用個人存取權杖。不支援電子郵件搭配 API token 的 Basic 驗證。只有 manifest 唯一宣告的網域也是唯一核准主機時，Cardbe 才會傳送 Bearer 憑證；自訂主機不會收到憑證。"
+        "en": "Self-hosted Jira requires a personal access token (PAT); Cloud requires an OAuth access token with Jira read permissions. Email plus API token (Basic auth) is unsupported. Cardbe sends the token only to the approved Base URL host under /rest/api/2 or /rest/api/3; the plugin never receives it.",
+        "zh-TW": "自架 Jira 使用個人存取權杖（PAT）；Cloud 使用具備 Jira 讀取權限的 OAuth 存取權杖。不支援電子郵件搭配 API token 的 Basic 驗證。Cardbe 僅傳送至已核准的 API 基底網址主機下的 /rest/api/2 或 /rest/api/3；插件不會取得權杖。"
       },
       "label": {
-        "en": "Bearer token (OAuth access token or Data Center PAT)",
-        "zh-TW": "Bearer token（OAuth access token 或 Data Center PAT）"
+        "en": "Bearer token (self-hosted PAT or Cloud OAuth)",
+        "zh-TW": "Bearer token（自架 PAT 或 Cloud OAuth）"
       },
       "type": "secret",
       "required": true
+    }
+  ],
+  "http_credentials": [
+    {
+      "destination": {
+        "type": "base_url",
+        "setting": "base_url"
+      },
+      "path_prefix": "/rest/api/2",
+      "bearer_secret": "token"
+    },
+    {
+      "destination": {
+        "setting": "base_url",
+        "type": "base_url"
+      },
+      "bearer_secret": "token",
+      "path_prefix": "/rest/api/3"
     }
   ]
 }

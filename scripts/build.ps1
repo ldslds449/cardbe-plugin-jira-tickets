@@ -12,6 +12,13 @@ Assert-Build ($manifest.id -ceq 'jira-tickets') 'Unexpected plugin ID'
 Assert-Build ($manifest.api_version -ceq '1.0.0') 'Unexpected API version'
 Assert-Build ($manifest.storage_schema_version -eq 1) 'Unexpected storage schema version'
 Assert-Build ($manifest.allow_custom_domains -eq $true) 'Custom API domains must be enabled'
+Assert-Build ($manifest.http_credentials.Count -eq 2) 'Expected two credential rules'
+foreach ($prefix in @('/rest/api/2', '/rest/api/3')) {
+    $credential = @($manifest.http_credentials | Where-Object { $_.path_prefix -ceq $prefix })
+    Assert-Build ($credential.Count -eq 1 -and $credential[0].destination.type -ceq 'base_url' -and $credential[0].destination.setting -ceq 'base_url' -and $credential[0].bearer_secret -ceq 'token') 'Credentials must be scoped to v2 and v3 Base URL paths'
+}
+$api = $manifest.settings | Where-Object { $_.key -ceq 'api' }
+Assert-Build ($api.default -ceq 'data-center' -and $api.options.Count -eq 2 -and $api.options[0].value -ceq 'data-center' -and $api.options[1].value -ceq 'cloud') 'Self-hosted Jira must be the default, with Cloud also supported'
 $wit = Get-Content -LiteralPath "$root/cardbe-plugin-api/wit/plugin.wit" -Raw -Encoding UTF8
 $witVersion = [regex]::Match($wit, '(?m)^package cardbe:plugin@([^;]+);').Groups[1].Value
 Assert-Build ($witVersion -ceq $manifest.api_version) 'WIT package version must match manifest.api_version'

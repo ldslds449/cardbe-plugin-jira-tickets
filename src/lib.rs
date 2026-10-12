@@ -486,7 +486,13 @@ mod tests {
     fn mapping_and_pagination_for_both_apis() {
         for api in ["cloud", "data-center"] {
             let mut urls = vec![];
-            let changes = synchronize(&context(api), &columns(), |url| {
+            let mut ctx = context(api);
+            if api == "data-center" {
+                let mut config: serde_json::Value = serde_json::from_str(&ctx.config_json).unwrap();
+                config["base_url"] = "https://jira.example.com/jira".into();
+                ctx.config_json = config.to_string();
+            }
+            let changes = synchronize(&ctx, &columns(), |url| {
                 urls.push(url.to_string());
                 let mut item = issue();
                 if urls.len() == 2 {
@@ -501,6 +507,11 @@ mod tests {
             })
             .unwrap();
             assert_eq!(urls.len(), 2);
+            assert!(urls.iter().all(|url| url.starts_with(if api == "cloud" {
+                "https://jira.example.com/rest/api/3/search/jql?"
+            } else {
+                "https://jira.example.com/jira/rest/api/2/search?"
+            })));
             assert!(urls[0].contains("jql=project%20%3D%20APP"));
             assert!(urls[1].contains(if api == "cloud" {
                 "nextPageToken=next%20%2B"
