@@ -116,7 +116,7 @@ Outputs `dist/manifest.json`, `dist/component.wasm`, and ZIP/SHA-256 files in th
 
 ## API provenance
 
-`cardbe-plugin-api/wit/plugin.wit` is provided by a Git submodule pinned to API tag `v1.1.0` (commit `89938f316de30dfd27d2c65bc0f94b73d1d3c337`), package `cardbe:plugin@1.1.0`. Its Git blob SHA-256 is `1f4c765a3b3655205887cc40e5c271fabc3ef2b9cf7bfe811df3c66e630ee288`. Install on a Cardbe host supporting API 1.1.0; API 1.0.0 draft hosts are incompatible.
+`cardbe-plugin-api/wit/plugin.wit` is provided by a Git submodule pinned to API tag `v1.1.0` (commit `023907c8294dfa5ca62e6078f13436b38d01eca0`), package `cardbe:plugin@1.1.0`. Its Git blob SHA-256 is `2243d8404bc212b5bd1335d743b78498296b2497d25eb2b832035259d2859163`. Install on a Cardbe host supporting API 1.1.0; API 1.0.0 draft hosts are incompatible.
 
 Self-hosted Jira uses REST v2 `POST /rest/api/2/search` with `startAt` pagination. Cloud queries use Jira Cloud REST v3 [enhanced JQL search](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/) at `POST /rest/api/3/search/jql`, with `nextPageToken` pagination. Requests send `Content-Type: application/json` and `X-Atlassian-Token: no-check`. Native tests use mock HTTP responses and do not require real Jira credentials.
 
