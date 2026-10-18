@@ -9,7 +9,7 @@ function Assert-Build($condition, $message) {
 
 $manifest = Get-Content -LiteralPath "$root/manifest.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert-Build ($manifest.id -ceq 'jira-tickets') 'Unexpected plugin ID'
-Assert-Build ($manifest.api_version -ceq '1.0.0') 'Unexpected API version'
+Assert-Build ($manifest.api_version -ceq '1.1.0') 'Unexpected API version'
 Assert-Build ($manifest.storage_schema_version -eq 1) 'Unexpected storage schema version'
 Assert-Build ($manifest.allow_custom_domains -eq $true) 'Custom API domains must be enabled'
 Assert-Build ($manifest.http_credentials.Count -eq 2) 'Expected two credential rules'

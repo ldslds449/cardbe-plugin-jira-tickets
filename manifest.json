@@ -8,8 +8,8 @@
     "en": "Import Jira tickets using custom JQL; create missing status columns automatically.",
     "zh-TW": "使用自訂 JQL 匯入 Jira 工作項目，自動建立缺少的狀態欄位。"
   },
-  "version": "1.0.1",
-  "api_version": "1.0.0",
+  "version": "1.1.0",
+  "api_version": "1.1.0",
   "storage_schema_version": 1,
   "domains": [
     "api.atlassian.com"
@@ -27,11 +27,97 @@
     "STATUS_COLUMN_NOT_FOUND",
     "CHANGESET_TOO_LARGE",
     "PAGE_LIMIT_EXCEEDED",
-    "BOARD_QUERY_FAILED"
+    "BOARD_QUERY_FAILED",
+    "API_ENDPOINT_NOT_FOUND",
+    "API_ENDPOINT_REMOVED",
+    "BOARD_INTERNAL_ERROR",
+    "BOARD_INVALID_ARGUMENT",
+    "BOARD_NOT_FOUND",
+    "BOARD_PERMISSION_DENIED",
+    "BOARD_RESOURCE_LIMIT",
+    "BOARD_SNAPSHOT_MISMATCH",
+    "COLUMN_LIMIT_EXCEEDED",
+    "CONFIG_API_INVALID",
+    "CONFIG_BASE_URL_INVALID",
+    "CONFIG_JQL_EMPTY",
+    "CONFIG_JSON_INVALID",
+    "CONFIG_SITE_URL_INVALID",
+    "ISSUE_REQUIRED_FIELD_EMPTY",
+    "JIRA_BAD_GATEWAY",
+    "JIRA_GATEWAY_TIMEOUT",
+    "JIRA_INTERNAL_SERVER_ERROR",
+    "JIRA_SERVICE_UNAVAILABLE",
+    "PAGE_EMPTY_BEFORE_TOTAL",
+    "PAGE_OFFSET_MISMATCH",
+    "PAGE_TOKEN_MISSING",
+    "PAGE_TOKEN_REPEATED",
+    "PAGE_TOTAL_MISSING",
+    "PROXY_AUTHENTICATION_REQUIRED",
+    "RESPONSE_JSON_INVALID",
+    "RESPONSE_JSON_TRUNCATED",
+    "RESPONSE_SCHEMA_INVALID",
+    "STATUS_COLUMN_DUPLICATED",
+    "STATUS_COLUMN_ID_INVALID",
+    "TICKET_LIMIT_EXCEEDED",
+    "NETWORK_FAILED",
+    "CONFIG_BASE_URL_API_PATH",
+    "STATUS_NAME_TOO_LONG"
   ],
   "log_codes": [
     "TICKETS_SYNCED",
-    "COLUMNS_CREATED"
+    "COLUMNS_CREATED",
+    "SYNC_STARTED",
+    "BOARD_COLUMNS_READ",
+    "HTTP_REQUESTS",
+    "HTTP_RESPONSES",
+    "HTTP_RETRIES",
+    "FIELDS_TRUNCATED",
+    "HTTP_LAST_STATUS",
+    "SYNC_FAILED",
+    "SYNC_COMPLETED",
+    "RESPONSE_JSON_ERROR_LINE",
+    "RESPONSE_JSON_ERROR_COLUMN",
+    "HTTP_FAILED",
+    "INVALID_JQL",
+    "AUTHENTICATION_FAILED",
+    "PERMISSION_DENIED",
+    "RATE_LIMITED",
+    "API_FAILED",
+    "PAGE_LIMIT_EXCEEDED",
+    "API_ENDPOINT_NOT_FOUND",
+    "API_ENDPOINT_REMOVED",
+    "BOARD_INTERNAL_ERROR",
+    "BOARD_INVALID_ARGUMENT",
+    "BOARD_NOT_FOUND",
+    "BOARD_PERMISSION_DENIED",
+    "BOARD_RESOURCE_LIMIT",
+    "BOARD_SNAPSHOT_MISMATCH",
+    "COLUMN_LIMIT_EXCEEDED",
+    "CONFIG_API_INVALID",
+    "CONFIG_BASE_URL_INVALID",
+    "CONFIG_JQL_EMPTY",
+    "CONFIG_JSON_INVALID",
+    "CONFIG_SITE_URL_INVALID",
+    "ISSUE_REQUIRED_FIELD_EMPTY",
+    "JIRA_BAD_GATEWAY",
+    "JIRA_GATEWAY_TIMEOUT",
+    "JIRA_INTERNAL_SERVER_ERROR",
+    "JIRA_SERVICE_UNAVAILABLE",
+    "PAGE_EMPTY_BEFORE_TOTAL",
+    "PAGE_OFFSET_MISMATCH",
+    "PAGE_TOKEN_MISSING",
+    "PAGE_TOKEN_REPEATED",
+    "PAGE_TOTAL_MISSING",
+    "PROXY_AUTHENTICATION_REQUIRED",
+    "RESPONSE_JSON_INVALID",
+    "RESPONSE_JSON_TRUNCATED",
+    "RESPONSE_SCHEMA_INVALID",
+    "STATUS_COLUMN_DUPLICATED",
+    "STATUS_COLUMN_ID_INVALID",
+    "TICKET_LIMIT_EXCEEDED",
+    "NETWORK_FAILED",
+    "CONFIG_BASE_URL_API_PATH",
+    "STATUS_NAME_TOO_LONG"
   ],
   "settings": [
     {
@@ -67,8 +153,8 @@
     {
       "key": "base_url",
       "description": {
-        "en": "HTTPS API base URL without /rest/api. Self-hosted: https://jira.example.com, including any /jira context path. Cloud: https://api.atlassian.com/ex/jira/<cloudId>. Approve its host separately; the token is scoped to /rest/api/2 and /rest/api/3 beneath this URL.",
-        "zh-TW": "HTTPS API 基底網址，不含 /rest/api。自架：https://jira.example.com，請包含 /jira 等站台路徑。Cloud：https://api.atlassian.com/ex/jira/<cloudId>。需另外核准主機；權杖僅傳送至此網址下的 /rest/api/2 與 /rest/api/3。"
+        "en": "HTTPS API base URL without /rest/api. Self-hosted: https://jira.example.com, including any /jira context path; add a custom HTTPS port when needed, for example https://jira.example.com:8443/jira (Jira's plain-HTTP port 8080 is not supported). Cloud: https://api.atlassian.com/ex/jira/<cloudId>. Approve its hostname (without the port) separately; the token is scoped to /rest/api/2 and /rest/api/3 beneath this URL.",
+        "zh-TW": "HTTPS API 基底網址，不含 /rest/api。自架：https://jira.example.com，請包含 /jira 等站台路徑；需要時可加上自訂 HTTPS 連接埠，例如 https://jira.example.com:8443/jira（不支援 Jira 預設的 HTTP 8080 連接埠）。Cloud：https://api.atlassian.com/ex/jira/<cloudId>。需另外核准主機名稱（不含連接埠）；權杖僅傳送至此網址下的 /rest/api/2 與 /rest/api/3。"
       },
       "label": {
         "en": "API base URL",
@@ -80,8 +166,8 @@
     {
       "key": "site_url",
       "description": {
-        "en": "HTTPS Jira site URL used for links and stable identities. Self-hosted: same as API base URL, including any context path. Cloud: https://your-team.atlassian.net. Keep this value stable between syncs.",
-        "zh-TW": "用於連結與識別的 HTTPS Jira 站台網址。自架：與 API 基底網址相同，包含站台路徑；Cloud：https://your-team.atlassian.net。請在各次同步間維持相同網址。"
+        "en": "HTTPS Jira site URL used for links and stable identities. Self-hosted: same as API base URL, including any context path and custom port. Cloud: https://your-team.atlassian.net. Enter the site root, not a /browse link. Keep this value stable between syncs: changing the host, port or path creates new cards (letter case and an explicit :443 do not).",
+        "zh-TW": "用於連結與識別的 HTTPS Jira 站台網址。自架：與 API 基底網址相同，包含站台路徑與自訂連接埠；Cloud：https://your-team.atlassian.net。請填站台根網址，不要填 /browse 連結。請在各次同步間維持相同網址：變更主機、連接埠或路徑會建立新卡片（大小寫與明確的 :443 不影響）。"
       },
       "label": {
         "en": "Jira site URL (ticket links)",
@@ -93,8 +179,8 @@
     {
       "key": "jql",
       "description": {
-        "en": "JQL query selecting tickets, for example project = APP AND fixVersion = \"1.2.0\". Missing Jira status columns are created automatically; duplicate matching column names fail the sync. Tickets that stop matching remain on the board.",
-        "zh-TW": "篩選 Jira 工作項目的 JQL，例如 project = APP AND fixVersion = \"1.2.0\"。缺少的狀態欄位會自動建立；同名欄位重複會導致同步失敗。不再符合查詢的卡片會保留在看板。"
+        "en": "JQL query selecting tickets, for example project = APP AND fixVersion = \"1.2.0\". Missing Jira status columns are created automatically; duplicate matching column names fail the sync. Tickets that stop matching remain on the board. For self-hosted Jira, JQL without ORDER BY is sorted by issue key to keep pagination stable.",
+        "zh-TW": "篩選 Jira 工作項目的 JQL，例如 project = APP AND fixVersion = \"1.2.0\"。缺少的狀態欄位會自動建立；同名欄位重複會導致同步失敗。不再符合查詢的卡片會保留在看板。自架 Jira 的 JQL 若沒有 ORDER BY，會自動依 issue key 排序以確保分頁穩定。"
       },
       "label": "JQL",
       "type": "text",
