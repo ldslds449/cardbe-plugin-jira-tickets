@@ -3,7 +3,7 @@ wit_bindgen::generate!({ path: "cardbe-plugin-api/wit", world: "plugin" });
 
 use cardbe::plugin::types::{
     Changeset, ColumnReference, CreateColumn, ExternalTask, HttpMethod, HttpRequest, HttpResponse,
-    LogLevel, Operation, UpsertExternalTask,
+    LogLevel, Operation, TaskPriority, UpsertExternalTask,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,7 +15,14 @@ export!(Jira);
 const NETWORK_RETRIES: u32 = 2;
 /// Issues per search page; keeps pages with long descriptions under the 2 MiB response limit.
 const PAGE_SIZE: usize = 50;
-const SEARCH_FIELDS: [&str; 5] = ["summary", "description", "status", "fixVersions", "updated"];
+const SEARCH_FIELDS: [&str; 6] = [
+    "summary",
+    "description",
+    "status",
+    "fixVersions",
+    "updated",
+    "priority",
+];
 // Host limits for external tasks, in UTF-8 bytes.
 const MAX_TITLE: usize = 4096;
 const MAX_DESCRIPTION: usize = 262_144;
@@ -88,31 +95,54 @@ struct Fields {
     #[serde(default, rename = "fixVersions")]
     fix_versions: Option<Vec<Named>>,
     updated: String,
+    priority: Option<Named>,
 }
 #[derive(Deserialize)]
 struct Named {
     name: String,
 }
 
+fn priority(value: Option<&Named>) -> Option<Option<TaskPriority>> {
+    Some(
+        match value.map(|v| v.name.trim().to_ascii_lowercase()).as_deref() {
+            None => None,
+            Some("highest" | "blocker") => Some(TaskPriority::Urgent),
+            Some("high" | "critical") => Some(TaskPriority::High),
+            Some("medium" | "major") => Some(TaskPriority::Medium),
+            Some("low" | "lowest" | "minor" | "trivial") => Some(TaskPriority::Low),
+            // shortcut: custom/localized priorities stay unchanged, add explicit mapping when needed.
+            Some(_) => return None,
+        },
+    )
+}
+
+fn report_priority(key: &str, priority: Option<TaskPriority>) -> Result<(), PluginError> {
+    #[cfg(not(test))]
+    cardbe::plugin::board::set_external_task_priority(key, priority).map_err(board_error)?;
+    #[cfg(test)]
+    let _ = (key, priority);
+    Ok(())
+}
+
+fn board_error(cause: cardbe::plugin::board::HostError) -> PluginError {
+    use cardbe::plugin::board::HostError;
+    error(
+        match cause {
+            HostError::InvalidArgument => "BOARD_INVALID_ARGUMENT",
+            HostError::PermissionDenied => "BOARD_PERMISSION_DENIED",
+            HostError::NotFound => "BOARD_NOT_FOUND",
+            HostError::ResourceLimit => "BOARD_RESOURCE_LIMIT",
+            HostError::InternalError => "BOARD_INTERNAL_ERROR",
+        },
+        None,
+    )
+}
+
 impl Guest for Jira {
     fn run(context: RunContext) -> Result<RunOutput, PluginError> {
         log("SYNC_STARTED", 1);
-        let snapshot = cardbe::plugin::board::list_columns().map_err(|cause| {
-            use cardbe::plugin::board::HostError;
-            failed(
-                error(
-                    match cause {
-                        HostError::InvalidArgument => "BOARD_INVALID_ARGUMENT",
-                        HostError::PermissionDenied => "BOARD_PERMISSION_DENIED",
-                        HostError::NotFound => "BOARD_NOT_FOUND",
-                        HostError::ResourceLimit => "BOARD_RESOURCE_LIMIT",
-                        HostError::InternalError => "BOARD_INTERNAL_ERROR",
-                    },
-                    None,
-                ),
-                log,
-            )
-        })?;
+        let snapshot = cardbe::plugin::board::list_columns()
+            .map_err(|cause| failed(board_error(cause), log))?;
         if snapshot.version != context.board_version {
             return Err(failed(error("BOARD_SNAPSHOT_MISMATCH", None), log));
         }
@@ -437,6 +467,7 @@ fn synchronize_logged(
             Ok(response)
         },
         &mut record,
+        report_priority,
     );
     record("HTTP_REQUESTS", requests);
     record("HTTP_RESPONSES", responses);
@@ -449,6 +480,7 @@ fn synchronize_pages(
     columns: &[Column],
     mut get: impl FnMut(&str, &[u8]) -> Result<HttpResponse, PluginError>,
     mut record: impl FnMut(&str, u32),
+    mut report: impl FnMut(&str, Option<TaskPriority>) -> Result<(), PluginError>,
 ) -> Result<RunOutput, PluginError> {
     let config: Config = serde_json::from_str(&context.config_json)
         .map_err(|_| error("CONFIG_JSON_INVALID", None))?;
@@ -485,6 +517,7 @@ fn synchronize_pages(
         )
     };
     let mut tasks: BTreeMap<String, ExternalTask> = BTreeMap::new();
+    let mut priorities = BTreeMap::new();
     let mut truncated = 0;
     let mut finished = false;
     let mut start = 0;
@@ -623,6 +656,10 @@ fn synchronize_pages(
                 .get(&task.external_key)
                 .is_none_or(|old| task.updated_at >= old.updated_at)
             {
+                priorities.insert(
+                    task.external_key.clone(),
+                    priority(issue.fields.priority.as_ref()),
+                );
                 tasks.insert(task.external_key.clone(), task);
             }
             if tasks.len() > 2000 {
@@ -669,7 +706,13 @@ fn synchronize_pages(
             &format!("Truncated the title, description or labels of {truncated} tickets to fit Cardbe limits."),
         );
     }
-    output(context, columns, tasks)
+    let result = output(context, columns, tasks)?;
+    for (key, value) in priorities {
+        if let Some(value) = value {
+            report(&key, value)?;
+        }
+    }
+    Ok(result)
 }
 
 fn output(
@@ -734,6 +777,108 @@ fn output(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn priority_reports_require_valid_output_and_propagate_host_errors() {
+        let mut item = issue();
+        item["fields"]["priority"] = json!({"name":"High"});
+        let invalid_columns = vec![Column {
+            id: -1,
+            name: "In Progress".into(),
+        }];
+        let failure = synchronize_pages(
+            &context("cloud"),
+            &invalid_columns,
+            |_, _| Ok(response(json!({"issues":[item.clone()],"isLast":true}))),
+            |_, _| {},
+            |_, _| panic!("invalid output must not stage priorities"),
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "STATUS_COLUMN_ID_INVALID");
+        let failure = synchronize_pages(
+            &context("cloud"),
+            &columns(),
+            |_, _| Ok(response(json!({"issues":[item.clone()],"isLast":true}))),
+            |_, _| {},
+            |_, _| {
+                Err(board_error(
+                    cardbe::plugin::board::HostError::PermissionDenied,
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "BOARD_PERMISSION_DENIED");
+    }
+    #[test]
+    fn source_priorities_follow_latest_issue_and_include_new_columns() {
+        for api in ["cloud", "data-center"] {
+            let mut first = issue();
+            first["fields"]["priority"] = json!({"name":"Low"});
+            let mut latest = first.clone();
+            latest["fields"]["updated"] = "2026-10-20".into();
+            latest["fields"]["priority"] = json!({"name":"Highest"});
+            let mut cleared = issue();
+            cleared["id"] = "2".into();
+            cleared["fields"]["priority"] = serde_json::Value::Null;
+            let mut custom = issue();
+            custom["id"] = "3".into();
+            custom["fields"]["priority"] = json!({"name":"Custom"});
+            let mut reported = vec![];
+            let result = synchronize_pages(
+                &context(api),
+                &[],
+                |_, _| {
+                    Ok(response(json!({
+                        "issues":[first,latest,cleared,custom],"isLast":true,"startAt":0,"total":4
+                    })))
+                },
+                |_, _| {},
+                |key, value| {
+                    reported.push((key.to_string(), value));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(result.changeset.is_some());
+            assert_eq!(
+                reported,
+                vec![
+                    (
+                        "jira:https://jira.example.com:1".into(),
+                        Some(TaskPriority::Urgent)
+                    ),
+                    ("jira:https://jira.example.com:2".into(), None),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn priority_mapping_uses_names_not_site_specific_ids() {
+        for (name, expected) in [
+            ("Highest", TaskPriority::Urgent),
+            ("Blocker", TaskPriority::Urgent),
+            ("High", TaskPriority::High),
+            ("Critical", TaskPriority::High),
+            ("Medium", TaskPriority::Medium),
+            ("Major", TaskPriority::Medium),
+            ("Low", TaskPriority::Low),
+            ("Lowest", TaskPriority::Low),
+            ("Minor", TaskPriority::Low),
+            (" trivial ", TaskPriority::Low),
+        ] {
+            assert_eq!(
+                priority(Some(&Named { name: name.into() })),
+                Some(Some(expected))
+            );
+        }
+        assert_eq!(priority(None), Some(None));
+        assert_eq!(
+            priority(Some(&Named {
+                name: "自訂".into()
+            })),
+            None
+        );
+    }
     fn context(api: &str) -> RunContext {
         RunContext { instance_id:"i".into(),run_id:"r".into(),cursor:None,
             config_json:json!({"api":api,"base_url":"https://jira.example.com","site_url":"https://jira.example.com","jql":"project = APP"}).to_string(),

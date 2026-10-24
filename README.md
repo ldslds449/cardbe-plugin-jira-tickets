@@ -1,6 +1,6 @@
 # Cardbe Plugin: Jira Tickets
 
-Import tickets from self-hosted Jira Server/Data Center using PAT and custom JQL. Jira Cloud OAuth is also supported. Built on [Cardbe Plugin API](https://github.com/ldslds449/cardbe-plugin-api) 1.1.0, using the typed `plugin` world.
+Import tickets from self-hosted Jira Server/Data Center using PAT and custom JQL. Jira Cloud OAuth is also supported. Built on [Cardbe Plugin API](https://github.com/ldslds449/cardbe-plugin-api) 1.3.0, using the typed `plugin` world.
 
 ## Configuration
 
@@ -34,14 +34,19 @@ Example JQL: `project = APP AND fixVersion = "1.2.0" ORDER BY updated ASC`.
 
 - Title: `APP-123 ticket summary`.
 - Column: reuse a column matching the status name, or create one when missing. Column creation and ticket upserts commit atomically; subsequent syncs move tickets when their status changes. At most 200 columns can be created per run.
+- Priority: Jira Highest/Blocker → urgent, High/Critical → high, Medium/Major → medium, Low/Lowest/Minor/Trivial → low (case-insensitive, trimmed). Missing or null priority clears the source priority; custom/localized names leave it unchanged. Reports use `set-external-task-priority`, so manual priority overrides are preserved and updates commit atomically with ticket upserts, including tickets in newly created columns. No extra Jira requests are needed.
 - Tags: version names from `fixVersions`, deduplicated with blank names skipped.
 - Description: configurable `description_template`, defaulting to `{url}\n\n{description}`. Supports `{url}`, `{description}`, `{key}`, and `{summary}`; unknown placeholders remain literal, and an empty template produces an empty description. Inserted Jira text is never interpreted as a template. Changing the template updates descriptions still managed by the source; manual card edits remain preserved. The original Jira description supports self-hosted Jira strings and Cloud ADF text, paragraphs, and text hyperlinks. ADF images, attachments, and layout are not imported.
 - Jira site + issue ID forms a stable identifier, so renaming a ticket key does not create a new card.
 - Each sync queries the full JQL result with POST search requests (JQL in the JSON body, so long JQL is not limited by URL length) in pages of 50, up to 100 pages and 2,000 cards. Failures do not return partial updates.
 - Self-hosted JQL without `ORDER BY` gets `ORDER BY key ASC` appended, so offset pagination does not skip tickets updated during a sync.
 - Fields beyond Cardbe limits are truncated at a UTF-8 boundary: titles to 4,096 bytes, descriptions to 262,144 bytes, version labels to 256 bytes and 100 labels (`FIELDS_TRUNCATED`). Status names over 64 bytes fail with `STATUS_NAME_TOO_LONG` because they become column names. A missing or `null` `fixVersions` field (hidden in some projects) imports no labels.
-- Tickets that no longer match the JQL or have been deleted remain on the board: the API supports upserts only, without deletion. Cardbe also preserves manual overrides, so manually moved cards may stop following Jira statuses.
+- Tickets that no longer match the JQL or have been deleted remain on the board: this plugin upserts tickets and does not archive or delete omitted tickets. Cardbe also preserves manual overrides, so manually moved cards may stop following Jira statuses.
 - Cardbe manages scheduling. Use one instance per source on each board.
+
+### API 1.3.0 scope
+
+The plugin uses source priority synchronization added in API 1.2.0. API 1.3.0 filtered board queries are available but unnecessary for JQL imports. Waiting relationships accept Cardbe task IDs or create-task keys, not external keys, so Jira issue links are not synchronized. Existing waiting relationships are preserved. Automatic archive/restore and done-column remapping are not enabled: Jira statuses continue to select matching columns.
 
 ## Logs
 
@@ -95,7 +100,7 @@ Version 1.1.0 replaces several generic error codes with the specific codes above
 
 The old codes remain declared in `error_codes` for compatibility but are no longer returned.
 
-Plugin 1.1.0 targets Cardbe Plugin API 1.1.0 (`api_version` `1.1.0`) and requires a Cardbe host built against that API; it does not run on API 1.0.0 hosts. Base URLs may now include a port, for example `https://jira.example.com:8443/jira`. Site URLs are now normalized (lowercase hostname, no `:443`); if an existing instance's site URL used uppercase letters or an explicit `:443`, its cards get new identities and are imported again once.
+Plugin 1.3.0 targets Cardbe Plugin API 1.3.0 (`api_version` `1.3.0`) and requires a Cardbe host supporting API 1.3.0. Base URLs may now include a port, for example `https://jira.example.com:8443/jira`. Site URLs are now normalized (lowercase hostname, no `:443`); if an existing instance's site URL used uppercase letters or an explicit `:443`, its cards get new identities and are imported again once.
 
 ## Build and validation
 
@@ -116,7 +121,7 @@ Outputs `dist/manifest.json`, `dist/component.wasm`, and ZIP/SHA-256 files in th
 
 ## API provenance
 
-`cardbe-plugin-api/wit/plugin.wit` is provided by a Git submodule pinned to API tag `v1.1.0` (commit `023907c8294dfa5ca62e6078f13436b38d01eca0`), package `cardbe:plugin@1.1.0`. Its Git blob SHA-256 is `2243d8404bc212b5bd1335d743b78498296b2497d25eb2b832035259d2859163`. Install on a Cardbe host supporting API 1.1.0; API 1.0.0 draft hosts are incompatible.
+`cardbe-plugin-api/wit/plugin.wit` is provided by a Git submodule pinned to API tag `v1.3.0` (commit `dda7023819eaed9776b2665a6adb620b51a61181`), package `cardbe:plugin@1.3.0`. Its Git blob SHA-256 is `0625a093462ce54625aa775566d415f70563abefef8527a5ed17fd6220e16762`. Install on a Cardbe host supporting API 1.3.0.
 
 Self-hosted Jira uses REST v2 `POST /rest/api/2/search` with `startAt` pagination. Cloud queries use Jira Cloud REST v3 [enhanced JQL search](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/) at `POST /rest/api/3/search/jql`, with `nextPageToken` pagination. Requests send `Content-Type: application/json` and `X-Atlassian-Token: no-check`. Native tests use mock HTTP responses and do not require real Jira credentials.
 
