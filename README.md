@@ -100,7 +100,7 @@ Version 1.1.0 replaces several generic error codes with the specific codes above
 
 The old codes remain declared in `error_codes` for compatibility but are no longer returned.
 
-Plugin 1.3.0 targets Cardbe Plugin API 1.3.0 (`api_version` `1.3.0`) and requires a Cardbe host supporting API 1.3.0. Base URLs may now include a port, for example `https://jira.example.com:8443/jira`. Site URLs are now normalized (lowercase hostname, no `:443`); if an existing instance's site URL used uppercase letters or an explicit `:443`, its cards get new identities and are imported again once.
+Plugin 1.2.0 targets Cardbe Plugin API 1.3.0 (`api_version` `1.3.0`) and requires a Cardbe host supporting API 1.3.0. Base URLs may now include a port, for example `https://jira.example.com:8443/jira`. Site URLs are now normalized (lowercase hostname, no `:443`); if an existing instance's site URL used uppercase letters or an explicit `:443`, its cards get new identities and are imported again once.
 
 ## Build and validation
 
