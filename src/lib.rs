@@ -1,12 +1,15 @@
 #![allow(clippy::too_many_arguments)] // Generated WIT ABI.
 wit_bindgen::generate!({ path: "cardbe-plugin-api/wit", world: "plugin" });
 
+use cardbe::plugin::board::HostError;
 use cardbe::plugin::types::{
     Changeset, ColumnReference, CreateColumn, ExternalTask, HttpMethod, HttpRequest, HttpResponse,
-    LogLevel, Operation, TaskPriority, UpsertExternalTask,
+    LogLevel, Operation, Task, TaskInfo, TaskPage, TaskPriority, UpsertExternalTask,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
+
+mod wiki;
 
 struct Jira;
 export!(Jira);
@@ -15,14 +18,29 @@ export!(Jira);
 const NETWORK_RETRIES: u32 = 2;
 /// Issues per search page; keeps pages with long descriptions under the 2 MiB response limit.
 const PAGE_SIZE: usize = 50;
-const SEARCH_FIELDS: [&str; 6] = [
+/// Smaller pages when comments are requested; 100 pages still cover the 2,000-ticket limit.
+const COMMENT_PAGE_SIZE: usize = 20;
+const COMMENT_FIELD: &str = "comment";
+const COMMENTS_PLACEHOLDER: &str = "{comments}";
+const SEARCH_FIELDS: [&str; 10] = [
     "summary",
     "description",
     "status",
     "fixVersions",
+    "versions",
     "updated",
     "priority",
+    "labels",
+    "assignee",
+    "creator",
 ];
+/// Archive and restore calls share the changeset's 200-operation budget.
+const MAX_OPERATIONS: usize = 200;
+/// Board tasks per `list-tasks` page while looking for cards to archive.
+const TASK_PAGE: u32 = 50;
+/// The cursor tracks IDs this plugin archived, within the host's 4 KiB cursor limit.
+const CURSOR_PREFIX: &str = "archived:";
+const MAX_CURSOR: usize = 4000;
 // Host limits for external tasks, in UTF-8 bytes.
 const MAX_TITLE: usize = 4096;
 const MAX_DESCRIPTION: usize = 262_144;
@@ -40,11 +58,22 @@ struct Config {
     api: String,
     #[serde(default = "default_description_template")]
     description_template: String,
+    /// Archive cards whose ticket no longer matches the JQL, and restore them when it does again.
+    #[serde(default)]
+    archive_missing: bool,
 }
 fn default_description_template() -> String {
     "{url}\n\n{description}".into()
 }
-fn render_description(template: &str, url: &str, body: &str, key: &str, summary: &str) -> String {
+struct Placeholders<'a> {
+    url: &'a str,
+    description: &'a str,
+    description_code: &'a str,
+    key: &'a str,
+    summary: &'a str,
+    comments: &'a str,
+}
+fn render_description(template: &str, values: &Placeholders) -> String {
     let mut out = String::new();
     let mut remaining = template;
     while let Some(start) = remaining.find('{') {
@@ -54,10 +83,12 @@ fn render_description(template: &str, url: &str, body: &str, key: &str, summary:
             break;
         };
         out.push_str(match &remaining[..=end] {
-            "{url}" => url,
-            "{description}" => body,
-            "{key}" => key,
-            "{summary}" => summary,
+            "{url}" => values.url,
+            "{description}" => values.description,
+            "{description_code}" => values.description_code,
+            "{key}" => values.key,
+            "{summary}" => values.summary,
+            COMMENTS_PLACEHOLDER => values.comments,
             other => other,
         });
         remaining = &remaining[end + 1..];
@@ -94,12 +125,95 @@ struct Fields {
     /// Absent when the field is hidden or unavailable in a project; may also be null.
     #[serde(default, rename = "fixVersions")]
     fix_versions: Option<Vec<Named>>,
+    /// Affects versions; absent or null like `fixVersions`.
+    #[serde(default, rename = "versions")]
+    affects_versions: Option<Vec<Named>>,
     updated: String,
     priority: Option<Named>,
+    /// Requested only when the description template uses `{comments}`.
+    #[serde(default)]
+    comment: Option<CommentPage>,
+    #[serde(default)]
+    labels: Option<Vec<String>>,
+    #[serde(default)]
+    assignee: Option<Author>,
+    #[serde(default)]
+    creator: Option<Author>,
 }
 #[derive(Deserialize)]
 struct Named {
     name: String,
+}
+#[derive(Deserialize)]
+struct CommentPage {
+    #[serde(default)]
+    comments: Option<Vec<Comment>>,
+}
+#[derive(Deserialize)]
+struct Comment {
+    #[serde(default)]
+    author: Option<Author>,
+    #[serde(default)]
+    body: Option<serde_json::Value>,
+    #[serde(default)]
+    created: Option<String>,
+}
+#[derive(Deserialize)]
+struct Author {
+    #[serde(default, rename = "displayName")]
+    display_name: Option<String>,
+}
+/// Formats comments in Jira order as separate Markdown block quotes: an
+/// `Author · YYYY-MM-DD HH:MM` header, an empty quote line, then the body.
+fn comments(page: Option<CommentPage>, wiki_markup: bool) -> String {
+    let mut out = String::new();
+    for comment in page.and_then(|p| p.comments).unwrap_or_default() {
+        let mut text = String::new();
+        let (body, _) = comment
+            .body
+            .as_ref()
+            .map(|value| text_field(value, wiki_markup))
+            .unwrap_or_default();
+        let author = comment
+            .author
+            .and_then(|a| a.display_name)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "Unknown".into());
+        text.push_str(author.trim());
+        if let Some(created) = comment.created.filter(|c| !c.is_empty()) {
+            text.push_str(" · ");
+            // ISO timestamps become `YYYY-MM-DD HH:MM`; other formats are kept as-is.
+            match created
+                .get(..16)
+                .filter(|t| t.as_bytes().get(10) == Some(&b'T'))
+            {
+                Some(time) => text.push_str(&time.replacen('T', " ", 1)),
+                None => text.push_str(&created),
+            }
+        }
+        // The empty quote line keeps the header and body as separate Markdown paragraphs.
+        if !body.trim().is_empty() {
+            text.push_str("\n\n");
+            text.push_str(body.trim());
+        }
+        // A blank line between comments ends each quote, so every comment is its own block.
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        let quoted: Vec<_> = text
+            .lines()
+            .map(|line| {
+                let line = line.trim_end();
+                if line.is_empty() {
+                    ">".to_string()
+                } else {
+                    format!("> {line}")
+                }
+            })
+            .collect();
+        out.push_str(&quoted.join("\n"));
+    }
+    out
 }
 
 fn priority(value: Option<&Named>) -> Option<Option<TaskPriority>> {
@@ -395,6 +509,18 @@ fn limit(mut value: String, max: usize, cut: &mut bool) -> String {
     }
     value
 }
+/// Returns a Jira text field as (Markdown, plain text). Wiki markup strings from
+/// self-hosted Jira are converted to Markdown; the plain text keeps the original.
+fn text_field(value: &serde_json::Value, wiki_markup: bool) -> (String, String) {
+    let mut plain = String::new();
+    description(value, &mut plain);
+    let markdown = if wiki_markup && value.is_string() {
+        wiki::to_markdown(&plain)
+    } else {
+        plain.clone()
+    };
+    (markdown, plain)
+}
 fn description(value: &serde_json::Value, out: &mut String) {
     if let Some(text) = value.as_str() {
         out.push_str(text);
@@ -468,6 +594,7 @@ fn synchronize_logged(
         },
         &mut record,
         report_priority,
+        &mut HostBoard,
     );
     record("HTTP_REQUESTS", requests);
     record("HTTP_RESPONSES", responses);
@@ -481,6 +608,7 @@ fn synchronize_pages(
     mut get: impl FnMut(&str, &[u8]) -> Result<HttpResponse, PluginError>,
     mut record: impl FnMut(&str, u32),
     mut report: impl FnMut(&str, Option<TaskPriority>) -> Result<(), PluginError>,
+    board: &mut impl BoardTasks,
 ) -> Result<RunOutput, PluginError> {
     let config: Config = serde_json::from_str(&context.config_json)
         .map_err(|_| error("CONFIG_JSON_INVALID", None))?;
@@ -516,7 +644,19 @@ fn synchronize_pages(
             ordered_jql(&config.jql),
         )
     };
+    let with_comments = config.description_template.contains(COMMENTS_PLACEHOLDER);
+    let mut fields = SEARCH_FIELDS.to_vec();
+    if with_comments {
+        fields.push(COMMENT_FIELD);
+    }
+    let page_size = if with_comments {
+        COMMENT_PAGE_SIZE
+    } else {
+        PAGE_SIZE
+    };
     let mut tasks: BTreeMap<String, ExternalTask> = BTreeMap::new();
+    // Jira issue key -> status, for matching board cards when archiving.
+    let mut issue_keys: BTreeMap<String, String> = BTreeMap::new();
     let mut priorities = BTreeMap::new();
     let mut truncated = 0;
     let mut finished = false;
@@ -526,8 +666,8 @@ fn synchronize_pages(
     for _ in 0..100 {
         let mut search = serde_json::json!({
             "jql": jql,
-            "fields": SEARCH_FIELDS,
-            "maxResults": PAGE_SIZE,
+            "fields": fields,
+            "maxResults": page_size,
         });
         if cloud {
             if let Some(token) = &token {
@@ -608,21 +748,50 @@ fn synchronize_pages(
                 return Err(error("STATUS_NAME_TOO_LONG", None));
             }
             let link = format!("{site}/browse/{}", encode(&issue.key));
-            let mut body = String::new();
-            if let Some(value) = issue.fields.description {
-                description(&value, &mut body);
-            }
-            let mut cut = false;
-            let mut labels: Vec<_> = issue
+            // Self-hosted Jira returns wiki markup strings; Cloud returns ADF documents.
+            let (body, plain) = issue
                 .fields
-                .fix_versions
-                .unwrap_or_default()
-                .into_iter()
-                .map(|v| limit(v.name, MAX_LABEL, &mut cut))
-                .filter(|v| !v.trim().is_empty())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
+                .description
+                .as_ref()
+                .map(|value| text_field(value, !cloud))
+                .unwrap_or_default();
+            let plain = plain.trim();
+            let code = if plain.is_empty() {
+                String::new()
+            } else {
+                wiki::code_block(plain, "")
+            };
+            let notes = comments(issue.fields.comment, !cloud);
+            let mut cut = false;
+            // Assignee and creator come first so they survive the label limit.
+            let people = [
+                ("assignee", issue.fields.assignee),
+                ("creator", issue.fields.creator),
+            ]
+            .into_iter()
+            .filter_map(|(role, user)| {
+                let name = user?.display_name?;
+                let name = name.trim();
+                (!name.is_empty()).then(|| format!("{role}:{name}"))
+            });
+            // Version tags are prefixed so fix and affects versions stay distinguishable.
+            let versions = |prefix: &'static str, list: Option<Vec<Named>>| {
+                list.unwrap_or_default()
+                    .into_iter()
+                    .filter(|v| !v.name.trim().is_empty())
+                    .map(move |v| format!("{prefix}:{}", v.name.trim()))
+            };
+            let tags: BTreeSet<_> = versions("fix", issue.fields.fix_versions)
+                .chain(versions("affects", issue.fields.affects_versions))
+                .chain(issue.fields.labels.unwrap_or_default())
                 .collect();
+            let mut labels: Vec<String> = vec![];
+            for label in people.chain(tags) {
+                let label = limit(label, MAX_LABEL, &mut cut);
+                if !label.trim().is_empty() && !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
             if labels.len() > MAX_LABELS {
                 labels.truncate(MAX_LABELS);
                 cut = true;
@@ -637,10 +806,14 @@ fn synchronize_pages(
                 description: limit(
                     render_description(
                         &config.description_template,
-                        &link,
-                        body.trim(),
-                        &issue.key,
-                        &issue.fields.summary,
+                        &Placeholders {
+                            url: &link,
+                            description: body.trim(),
+                            description_code: &code,
+                            key: &issue.key,
+                            summary: &issue.fields.summary,
+                            comments: &notes,
+                        },
                     ),
                     MAX_DESCRIPTION,
                     &mut cut,
@@ -660,6 +833,7 @@ fn synchronize_pages(
                     task.external_key.clone(),
                     priority(issue.fields.priority.as_ref()),
                 );
+                issue_keys.insert(issue.key.clone(), task.state.trim().to_string());
                 tasks.insert(task.external_key.clone(), task);
             }
             if tasks.len() > 2000 {
@@ -706,20 +880,246 @@ fn synchronize_pages(
             &format!("Truncated the title, description or labels of {truncated} tickets to fit Cardbe limits."),
         );
     }
-    let result = output(context, columns, tasks)?;
+    let (mut result, destinations) = output(context, columns, tasks)?;
     for (key, value) in priorities {
         if let Some(value) = value {
             report(&key, value)?;
         }
     }
+    result.cursor = if config.archive_missing {
+        if !config.description_template.contains("{url}") {
+            message(
+                LogLevel::Warn,
+                "Archiving finds cards by their ticket link; add {url} to the description template.",
+            );
+        }
+        let issues = issue_keys
+            .into_iter()
+            .map(|(key, status)| (key, destinations[&status].clone()))
+            .collect();
+        let used = result.changeset.as_ref().map_or(0, |c| c.operations.len());
+        reconcile(
+            &site,
+            &issues,
+            context.cursor.as_deref(),
+            MAX_OPERATIONS.saturating_sub(used),
+            &context.board_version,
+            board,
+            &mut record,
+        )?
+    } else {
+        context.cursor.clone()
+    };
     Ok(result)
+}
+
+/// Board task access for archiving; tests replace the host implementation.
+trait BoardTasks {
+    fn list_active(&mut self, offset: u32, limit: u32) -> Result<TaskPage, HostError>;
+    /// None when `id` is not an archived task.
+    fn archived(&mut self, id: i64) -> Result<Option<TaskInfo>, HostError>;
+    fn archive(&mut self, id: i64) -> Result<(), HostError>;
+    fn restore(&mut self, id: i64, column: &ColumnReference) -> Result<(), HostError>;
+}
+struct HostBoard;
+#[cfg(not(test))]
+impl BoardTasks for HostBoard {
+    fn list_active(&mut self, offset: u32, limit: u32) -> Result<TaskPage, HostError> {
+        use cardbe::plugin::types::{DueFilter, TaskQuery, TaskSort, TaskStatus};
+        cardbe::plugin::board::list_tasks(&TaskQuery {
+            query: String::new(),
+            column_id: None,
+            status: TaskStatus::Active,
+            sort: TaskSort::Title,
+            due: DueFilter::All,
+            due_start: None,
+            due_end: None,
+            archive_start: None,
+            archive_end: None,
+            search_options: None,
+            offset,
+            limit,
+        })
+    }
+    fn archived(&mut self, id: i64) -> Result<Option<TaskInfo>, HostError> {
+        match cardbe::plugin::board::get_task(id, true) {
+            Ok(snapshot) => Ok(Some(snapshot.task).filter(|info| info.archived)),
+            Err(HostError::NotFound) => Ok(None),
+            Err(cause) => Err(cause),
+        }
+    }
+    fn archive(&mut self, id: i64) -> Result<(), HostError> {
+        cardbe::plugin::board::archive_task(&cardbe::plugin::types::TaskReference::Id(id))
+    }
+    fn restore(&mut self, id: i64, column: &ColumnReference) -> Result<(), HostError> {
+        cardbe::plugin::board::restore_task(id, column)
+    }
+}
+#[cfg(test)]
+impl BoardTasks for HostBoard {
+    fn list_active(&mut self, _: u32, _: u32) -> Result<TaskPage, HostError> {
+        unreachable!("tests archive through a mock board")
+    }
+    fn archived(&mut self, _: i64) -> Result<Option<TaskInfo>, HostError> {
+        unreachable!("tests archive through a mock board")
+    }
+    fn archive(&mut self, _: i64) -> Result<(), HostError> {
+        unreachable!("tests archive through a mock board")
+    }
+    fn restore(&mut self, _: i64, _: &ColumnReference) -> Result<(), HostError> {
+        unreachable!("tests archive through a mock board")
+    }
+}
+
+/// The Jira key of a card this source manages: its title starts with the key and its
+/// description links to that key on this site. Cards edited by the user stop matching
+/// and are never archived.
+fn source_key<'a>(site: &str, task: &'a Task) -> Option<&'a str> {
+    let key = task.title.split(' ').next()?;
+    let (project, number) = key.rsplit_once('-')?;
+    let valid = project
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_uppercase())
+        && project
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit());
+    if !valid {
+        return None;
+    }
+    let link = format!("{site}/browse/{key}");
+    let mut rest = task.description.as_str();
+    while let Some(i) = rest.find(&link) {
+        let after = &rest[i + link.len()..];
+        if !after
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Some(key);
+        }
+        rest = after;
+    }
+    None
+}
+
+fn encode_cursor(ids: &[i64]) -> Option<String> {
+    // Oldest IDs are dropped first when the list outgrows the cursor.
+    for start in 0..ids.len() {
+        let list: Vec<_> = ids[start..].iter().map(i64::to_string).collect();
+        let cursor = format!("{CURSOR_PREFIX}{}", list.join(","));
+        if cursor.len() <= MAX_CURSOR {
+            return Some(cursor);
+        }
+    }
+    None
+}
+
+/// Restores cards this plugin archived whose ticket matches again, then archives active
+/// cards of this source whose ticket is no longer returned. Returns the new cursor.
+fn reconcile(
+    site: &str,
+    issues: &BTreeMap<String, ColumnReference>,
+    cursor: Option<&str>,
+    mut budget: usize,
+    version: &str,
+    board: &mut impl BoardTasks,
+    record: &mut impl FnMut(&str, u32),
+) -> Result<Option<String>, PluginError> {
+    if issues.is_empty() {
+        // Jira returns no results, rather than an error, for queries the token cannot see.
+        message(
+            LogLevel::Warn,
+            "The JQL returned no tickets; archiving was skipped so an emptied query cannot archive every card.",
+        );
+        return Ok(cursor.map(str::to_string));
+    }
+    let tracked: Vec<i64> = cursor
+        .and_then(|c| c.strip_prefix(CURSOR_PREFIX))
+        .map(|ids| ids.split(',').filter_map(|id| id.parse().ok()).collect())
+        .unwrap_or_default();
+    let mut kept = vec![];
+    let mut restored = 0;
+    for id in tracked {
+        // Cards restored or removed by the user are no longer tracked.
+        let Some(info) = board.archived(id).map_err(board_error)? else {
+            continue;
+        };
+        if let Some(column) = source_key(site, &info.task).and_then(|key| issues.get(key)) {
+            if budget > 0 {
+                board.restore(id, column).map_err(board_error)?;
+                budget -= 1;
+                restored += 1;
+                continue;
+            }
+        }
+        kept.push(id);
+    }
+    let mut archived = 0;
+    let mut deferred = 0;
+    let mut offset = 0;
+    loop {
+        let page = match board.list_active(offset, TASK_PAGE) {
+            Ok(page) => page,
+            Err(HostError::ResourceLimit) => {
+                message(
+                    LogLevel::Warn,
+                    "Listing board cards reached the host query budget; remaining cards are checked next run.",
+                );
+                break;
+            }
+            Err(cause) => return Err(board_error(cause)),
+        };
+        if page.version != version {
+            return Err(error("BOARD_SNAPSHOT_MISMATCH", None));
+        }
+        let count = page.tasks.len();
+        for info in page.tasks {
+            // Recurring cards would continue with a new occurrence instead of leaving.
+            if info.archived || info.task.recurrence.is_some() {
+                continue;
+            }
+            match source_key(site, &info.task) {
+                Some(key) if !issues.contains_key(key) => {}
+                _ => continue,
+            }
+            if budget == 0 {
+                deferred += 1;
+                continue;
+            }
+            board.archive(info.task.id).map_err(board_error)?;
+            budget -= 1;
+            archived += 1;
+            kept.push(info.task.id);
+        }
+        if count < TASK_PAGE as usize {
+            break;
+        }
+        offset += TASK_PAGE;
+    }
+    record("TICKETS_ARCHIVED", archived);
+    record("TICKETS_RESTORED", restored);
+    if deferred > 0 {
+        record("ARCHIVE_DEFERRED", deferred);
+        message(
+            LogLevel::Warn,
+            &format!("Archiving {deferred} more cards exceeds this run's 200-operation limit; they are archived next run."),
+        );
+    }
+    message(
+        LogLevel::Info,
+        &format!("Archived {archived} cards whose tickets no longer match; restored {restored}."),
+    );
+    Ok(encode_cursor(&kept))
 }
 
 fn output(
     context: &RunContext,
     columns: &[Column],
     tasks: BTreeMap<String, ExternalTask>,
-) -> Result<RunOutput, PluginError> {
+) -> Result<(RunOutput, BTreeMap<String, ColumnReference>), PluginError> {
     let mut destinations = BTreeMap::new();
     let mut operations = vec![];
     let mut existing = vec![];
@@ -759,7 +1159,7 @@ fn output(
             })),
         }
     }
-    Ok(RunOutput {
+    let output = RunOutput {
         tasks: existing,
         changeset: if operations.is_empty() {
             None
@@ -770,7 +1170,8 @@ fn output(
             })
         },
         cursor: None,
-    })
+    };
+    Ok((output, destinations))
 }
 
 #[cfg(test)]
@@ -791,6 +1192,7 @@ mod tests {
             |_, _| Ok(response(json!({"issues":[item.clone()],"isLast":true}))),
             |_, _| {},
             |_, _| panic!("invalid output must not stage priorities"),
+            &mut HostBoard,
         )
         .unwrap_err();
         assert_eq!(failure.code, "STATUS_COLUMN_ID_INVALID");
@@ -804,6 +1206,7 @@ mod tests {
                     cardbe::plugin::board::HostError::PermissionDenied,
                 ))
             },
+            &mut HostBoard,
         )
         .unwrap_err();
         assert_eq!(failure.code, "BOARD_PERMISSION_DENIED");
@@ -836,6 +1239,7 @@ mod tests {
                     reported.push((key.to_string(), value));
                     Ok(())
                 },
+                &mut HostBoard,
             )
             .unwrap();
             assert!(result.changeset.is_some());
@@ -1268,11 +1672,118 @@ mod tests {
             changes.tasks[0].description,
             "APP-1: Fix\nLiteral {url}\nhttps://jira.example.com/browse/APP-1"
         );
-        assert_eq!(
-            render_description("{unknown} {", "", "", "", ""),
-            "{unknown} {"
+        let values = Placeholders {
+            url: "url",
+            description: "body",
+            description_code: "code",
+            key: "key",
+            summary: "summary",
+            comments: "notes",
+        };
+        assert_eq!(render_description("{unknown} {", &values), "{unknown} {");
+        assert_eq!(render_description("", &values), "");
+        assert_eq!(render_description("{comments}", &values), "notes");
+    }
+    #[test]
+    fn comments_are_requested_only_when_the_template_uses_them() {
+        for api in ["cloud", "data-center"] {
+            let ctx = configured(
+                api,
+                json!({"description_template":"{description}\n\n{comments}"}),
+            );
+            let mut bodies: Vec<serde_json::Value> = vec![];
+            let changes = synchronize(&ctx, &columns(), |_, body| {
+                bodies.push(serde_json::from_slice(body).unwrap());
+                let mut item = issue();
+                item["fields"]["comment"] = if api == "cloud" {
+                    json!({"comments":[
+                        {"author":{"displayName":"Alice"},"created":"2026-10-10T12:00:00.000+0000",
+                         "body":{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Looks {url} good"}]}]}},
+                        {"body":{"type":"doc","content":[]}}
+                    ]})
+                } else {
+                    json!({"comments":[
+                        {"author":{"displayName":"Alice"},"created":"2026-10-10T12:00:00.000+0000","body":"Looks {url} good"},
+                        {"author":{"displayName":" "},"body":""}
+                    ]})
+                };
+                Ok(response(if api == "cloud" {
+                    json!({"issues":[item],"isLast":true})
+                } else {
+                    json!({"issues":[item],"startAt":0,"total":1})
+                }))
+            })
+            .unwrap();
+            let mut fields = SEARCH_FIELDS.to_vec();
+            fields.push(COMMENT_FIELD);
+            assert_eq!(bodies[0]["fields"], json!(fields));
+            assert_eq!(bodies[0]["maxResults"], COMMENT_PAGE_SIZE);
+            assert_eq!(
+                changes.tasks[0].description,
+                "Details\n\n> Alice · 2026-10-10 12:00\n>\n> Looks {url} good\n\n> Unknown"
+            );
+        }
+        // Self-hosted wiki markup becomes Markdown; {description_code} keeps the original.
+        let ctx = configured(
+            "data-center",
+            json!({"description_template":"{description}\n\n{description_code}\n\n{comments}"}),
         );
-        assert_eq!(render_description("", "url", "body", "key", "summary"), "");
+        let changes = synchronize(&ctx, &columns(), |_, _| {
+            let mut item = issue();
+            item["fields"]["description"] = "h2. Steps\n# Open *menu*\n{code}a ``` b{code}".into();
+            item["fields"]["comment"] = json!({"comments":[{"author":{"displayName":"Al"},"body":"* see [doc|https://d.io]"}]});
+            Ok(response(json!({"issues":[item],"startAt":0,"total":1})))
+        })
+        .unwrap();
+        assert_eq!(
+            changes.tasks[0].description,
+            "## Steps\n1. Open **menu**\n````\na ``` b\n````\n\n\
+             ````\nh2. Steps\n# Open *menu*\n{code}a ``` b{code}\n````\n\n\
+             > Al\n>\n> - see [doc](https://d.io)"
+        );
+        // Cloud ADF text is not reinterpreted as wiki markup.
+        let ctx = configured(
+            "cloud",
+            json!({"description_template":"{description}|{description_code}"}),
+        );
+        let changes = synchronize(&ctx, &columns(), |_, _| {
+            let mut item = issue();
+            item["fields"]["description"] = json!({"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"h1. *x*"}]}]});
+            Ok(response(json!({"issues":[item],"isLast":true})))
+        })
+        .unwrap();
+        assert_eq!(changes.tasks[0].description, "h1. *x*|```\nh1. *x*\n```");
+        let ctx = configured(
+            "cloud",
+            json!({"description_template":"[{description_code}]"}),
+        );
+        let changes = synchronize(&ctx, &columns(), |_, _| {
+            let mut item = issue();
+            item["fields"]["description"] = serde_json::Value::Null;
+            Ok(response(json!({"issues":[item],"isLast":true})))
+        })
+        .unwrap();
+        assert_eq!(changes.tasks[0].description, "[]");
+        // Every body line is quoted, including blank lines inside the comment.
+        let page: CommentPage = serde_json::from_value(json!({"comments":[
+            {"author":{"displayName":"Bob"},"created":"yesterday","body":"Line 1  \n\nLine 2\n"}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            comments(Some(page), true),
+            "> Bob · yesterday\n>\n> Line 1\n>\n> Line 2"
+        );
+        // Missing or null comment fields render nothing.
+        let ctx = configured("cloud", json!({"description_template":"[{comments}]"}));
+        for value in [serde_json::Value::Null, json!({}), json!({"comments":null})] {
+            let changes = synchronize(&ctx, &columns(), |_, _| {
+                let mut item = issue();
+                item["fields"]["comment"] = value.clone();
+                Ok(response(json!({"issues":[item],"isLast":true})))
+            })
+            .unwrap();
+            assert_eq!(changes.tasks[0].description, "[]");
+        }
     }
     #[test]
     fn mapping_and_pagination_for_both_apis() {
@@ -1322,7 +1833,7 @@ mod tests {
             let task = &changes.tasks[0];
             assert_eq!(task.title, "APP-1 Latest");
             assert_eq!(task.column_id, 0);
-            assert_eq!(task.labels, vec!["1.2"]);
+            assert_eq!(task.labels, vec!["fix:1.2"]);
             assert_eq!(
                 task.description,
                 "https://jira.example.com/browse/APP-1\n\nDetails"
@@ -1441,5 +1952,224 @@ mod tests {
             assert_eq!(normalize_url(base), None, "{base}");
         }
         assert!(normalize_url("https://api.atlassian.com/ex/jira/cloud-id").is_some());
+    }
+
+    #[derive(Default)]
+    struct MockBoard {
+        active: Vec<TaskInfo>,
+        archived: Vec<TaskInfo>,
+        version: Option<String>,
+        resource_limit: bool,
+        calls: Vec<String>,
+    }
+    impl BoardTasks for MockBoard {
+        fn list_active(&mut self, offset: u32, limit: u32) -> Result<TaskPage, HostError> {
+            if self.resource_limit {
+                return Err(HostError::ResourceLimit);
+            }
+            Ok(TaskPage {
+                version: self.version.clone().unwrap_or_else(|| "snapshot".into()),
+                tasks: self
+                    .active
+                    .iter()
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .cloned()
+                    .collect(),
+                offset,
+                limit,
+            })
+        }
+        fn archived(&mut self, id: i64) -> Result<Option<TaskInfo>, HostError> {
+            Ok(self.archived.iter().find(|t| t.task.id == id).cloned())
+        }
+        fn archive(&mut self, id: i64) -> Result<(), HostError> {
+            self.calls.push(format!("archive {id}"));
+            Ok(())
+        }
+        fn restore(&mut self, id: i64, column: &ColumnReference) -> Result<(), HostError> {
+            self.calls.push(match column {
+                ColumnReference::Id(c) => format!("restore {id} -> {c}"),
+                ColumnReference::Temporary(k) => format!("restore {id} -> {k}"),
+            });
+            Ok(())
+        }
+    }
+    fn card(id: i64, title: &str, description: &str) -> TaskInfo {
+        TaskInfo {
+            board_id: 1,
+            column_id: Some(0),
+            position: Some(0),
+            archived: false,
+            task: Task {
+                id,
+                title: title.into(),
+                description: description.into(),
+                pinned: false,
+                color: String::new(),
+                start_time: None,
+                due_time: None,
+                created_time: None,
+                start_at_midnight: false,
+                due_at_midnight: false,
+                labels: vec![],
+                items: vec![],
+                recurrence: None,
+            },
+        }
+    }
+    fn run_with_board(
+        ctx: &RunContext,
+        columns: &[Column],
+        issues: Vec<serde_json::Value>,
+        board: &mut MockBoard,
+    ) -> (Result<RunOutput, PluginError>, Vec<(String, u32)>) {
+        let mut logs = vec![];
+        let result = synchronize_pages(
+            ctx,
+            columns,
+            |_, _| Ok(response(json!({"issues":issues.clone(),"isLast":true}))),
+            |code, count| logs.push((code.to_string(), count)),
+            |_, _| Ok(()),
+            board,
+        );
+        (result, logs)
+    }
+    #[test]
+    fn archives_cards_whose_tickets_left_the_query_and_restores_returning_ones() {
+        let link = "https://jira.example.com/browse/";
+        let mut ctx = configured("cloud", json!({"archive_missing":true}));
+        ctx.cursor = Some("archived:20,21,22".into());
+        let mut recurring = card(15, "APP-5 Weekly", &format!("{link}APP-5"));
+        recurring.task.recurrence = Some(cardbe::plugin::types::Recurrence {
+            frequency: cardbe::plugin::types::RecurrenceFrequency::Weekly,
+            interval: 1,
+        });
+        let mut returning = card(20, "APP-1 Fix", &format!("{link}APP-1"));
+        returning.archived = true;
+        let mut still_gone = card(21, "APP-9 Old", &format!("{link}APP-9"));
+        still_gone.archived = true;
+        let mut board = MockBoard {
+            active: vec![
+                card(10, "APP-1 Fix", &format!("{link}APP-1\n\nDetails")),
+                card(11, "APP-2 Closed", &format!("Text\n{link}APP-2")),
+                card(12, "APP-3 Edited", &format!("{link}APP-30")),
+                card(13, "Manual card", &format!("{link}APP-6")),
+                card(
+                    14,
+                    "APP-4 Other site",
+                    "https://other.example.com/browse/APP-4",
+                ),
+                recurring,
+                card(16, "app-7 lowercase", &format!("{link}app-7")),
+            ],
+            archived: vec![returning, still_gone],
+            ..Default::default()
+        };
+        let (result, logs) = run_with_board(&ctx, &columns(), vec![issue()], &mut board);
+        let result = result.unwrap();
+        assert_eq!(board.calls, vec!["restore 20 -> 0", "archive 11"]);
+        assert_eq!(result.cursor.as_deref(), Some("archived:21,11"));
+        assert!(logs.contains(&("TICKETS_ARCHIVED".into(), 1)));
+        assert!(logs.contains(&("TICKETS_RESTORED".into(), 1)));
+
+        // Restoring into a column created in the same run uses its temporary key.
+        let mut board = MockBoard {
+            archived: vec![card(20, "APP-1 Fix", &format!("{link}APP-1"))],
+            ..Default::default()
+        };
+        board.archived[0].archived = true;
+        let (result, _) = run_with_board(&ctx, &[], vec![issue()], &mut board);
+        assert_eq!(board.calls, vec!["restore 20 -> status:0"]);
+        // 21 and 22 are no longer archived, and 20 was restored: nothing stays tracked.
+        assert_eq!(result.unwrap().cursor, None);
+    }
+    #[test]
+    fn archiving_is_opt_in_and_skipped_for_empty_results() {
+        let link = "https://jira.example.com/browse/";
+        let stale = || MockBoard {
+            active: vec![card(11, "APP-2 Closed", &format!("{link}APP-2"))],
+            ..Default::default()
+        };
+        let mut ctx = context("cloud");
+        ctx.cursor = Some("archived:5".into());
+        let mut board = stale();
+        let (result, _) = run_with_board(&ctx, &columns(), vec![issue()], &mut board);
+        assert!(board.calls.is_empty());
+        assert_eq!(result.unwrap().cursor.as_deref(), Some("archived:5"));
+
+        let mut ctx = configured("cloud", json!({"archive_missing":true}));
+        ctx.cursor = Some("archived:5".into());
+        let mut board = stale();
+        let (result, _) = run_with_board(&ctx, &columns(), vec![], &mut board);
+        assert!(board.calls.is_empty());
+        assert_eq!(result.unwrap().cursor.as_deref(), Some("archived:5"));
+
+        let mut board = MockBoard {
+            resource_limit: true,
+            ..stale()
+        };
+        let (result, _) = run_with_board(&ctx, &columns(), vec![issue()], &mut board);
+        assert!(result.is_ok() && board.calls.is_empty());
+
+        let mut board = MockBoard {
+            version: Some("other".into()),
+            ..stale()
+        };
+        let (result, _) = run_with_board(&ctx, &columns(), vec![issue()], &mut board);
+        assert_eq!(result.unwrap_err().code, "BOARD_SNAPSHOT_MISMATCH");
+    }
+    #[test]
+    fn archiving_respects_the_operation_budget() {
+        let link = "https://jira.example.com/browse/";
+        let ctx = configured("cloud", json!({"archive_missing":true}));
+        let mut board = MockBoard {
+            active: (0..205)
+                .map(|i| card(i, &format!("OLD-{i} x"), &format!("{link}OLD-{i}")))
+                .collect(),
+            ..Default::default()
+        };
+        // A new status column and its upsert use 2 of the 200 operations.
+        let (result, logs) = run_with_board(&ctx, &[], vec![issue()], &mut board);
+        assert_eq!(board.calls.len(), 198);
+        assert!(logs.contains(&("ARCHIVE_DEFERRED".into(), 7)));
+        let cursor = result.unwrap().cursor.unwrap();
+        assert!(cursor.starts_with("archived:0,1,") && cursor.len() <= MAX_CURSOR);
+        let ids: Vec<i64> = (0..2000).collect();
+        let cursor = encode_cursor(&ids).unwrap();
+        assert!(cursor.len() <= MAX_CURSOR && cursor.ends_with(",1999"));
+        assert_eq!(encode_cursor(&[]), None);
+    }
+    #[test]
+    fn assignee_creator_and_labels_become_tags() {
+        let changes = synchronize(&context("cloud"), &columns(), |_, _| {
+            let mut item = issue();
+            item["fields"]["assignee"] = json!({"displayName":" Alice "});
+            item["fields"]["creator"] = json!({"displayName":"Bob"});
+            item["fields"]["labels"] = json!(["backend", "1.2", " "]);
+            item["fields"]["versions"] = json!([{"name":"1.1"}, {"name":" "}]);
+            Ok(response(json!({"issues":[item],"isLast":true})))
+        })
+        .unwrap();
+        assert_eq!(
+            changes.tasks[0].labels,
+            vec![
+                "assignee:Alice",
+                "creator:Bob",
+                "1.2",
+                "affects:1.1",
+                "backend",
+                "fix:1.2"
+            ]
+        );
+        let changes = synchronize(&context("cloud"), &columns(), |_, _| {
+            let mut item = issue();
+            item["fields"]["assignee"] = serde_json::Value::Null;
+            item["fields"]["creator"] = json!({});
+            item["fields"]["labels"] = serde_json::Value::Null;
+            Ok(response(json!({"issues":[item],"isLast":true})))
+        })
+        .unwrap();
+        assert_eq!(changes.tasks[0].labels, vec!["fix:1.2"]);
     }
 }

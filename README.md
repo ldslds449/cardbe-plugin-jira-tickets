@@ -35,22 +35,55 @@ Example JQL: `project = APP AND fixVersion = "1.2.0" ORDER BY updated ASC`.
 - Title: `APP-123 ticket summary`.
 - Column: reuse a column matching the status name, or create one when missing. Column creation and ticket upserts commit atomically; subsequent syncs move tickets when their status changes. At most 200 columns can be created per run.
 - Priority: Jira Highest/Blocker → urgent, High/Critical → high, Medium/Major → medium, Low/Lowest/Minor/Trivial → low (case-insensitive, trimmed). Missing or null priority clears the source priority; custom/localized names leave it unchanged. Reports use `set-external-task-priority`, so manual priority overrides are preserved and updates commit atomically with ticket upserts, including tickets in newly created columns. No extra Jira requests are needed.
-- Tags: version names from `fixVersions`, deduplicated with blank names skipped.
-- Description: configurable `description_template`, defaulting to `{url}\n\n{description}`. Supports `{url}`, `{description}`, `{key}`, and `{summary}`; unknown placeholders remain literal, and an empty template produces an empty description. Inserted Jira text is never interpreted as a template. Changing the template updates descriptions still managed by the source; manual card edits remain preserved. The original Jira description supports self-hosted Jira strings and Cloud ADF text, paragraphs, and text hyperlinks. ADF images, attachments, and layout are not imported.
+- Tags: `assignee:<name>` and `creator:<name>` (Jira display names, omitted when unassigned or hidden), then Jira `labels`, fix versions as `fix:<version>` and affects versions as `affects:<version>`, deduplicated with blank names skipped. Assignee and creator come first so they survive the 100-label limit; reassigning a ticket replaces its assignee tag on the next sync.
+- Description: configurable `description_template`, defaulting to `{url}\n\n{description}`. Placeholders:
+
+  | Placeholder | Value |
+  | --- | --- |
+  | `{url}` | Ticket link, `<site URL>/browse/APP-123` |
+  | `{key}` | Issue key, e.g. `APP-123` |
+  | `{summary}` | Ticket title |
+  | `{description}` | Jira description as Markdown. Self-hosted wiki markup is converted (see below); Cloud ADF text is inserted as extracted |
+  | `{description_code}` | The original description text in a fenced code block, shown exactly as written. The fence is longer than any backtick run inside, so the content cannot close it early. Empty when there is no description |
+  | `{comments}` | Jira comments in the order Jira returns them. Each comment is a separate Markdown block quote (`> `): an `Author · YYYY-MM-DD HH:MM` header, an empty `>` line, then the comment text with every line quoted. Comments are separated by blank lines. Missing authors show `Unknown`. |
+
+  The `comment` field is requested only when the template contains `{comments}`; such syncs use pages of 20 issues to stay within the host's response size limit. Jira decides how many comments the search returns per issue, and comments you lack permission to view are not included. Adding a comment updates the issue's `updated` timestamp, so the next sync refreshes the card. Example: `{url}\n\n{description}\n\n{comments}`.
+
+  Self-hosted Jira returns descriptions and comments as wiki markup, which `{description}` and `{comments}` convert to Markdown: `h1.`–`h6.` headings, `*`/`#`/`-` lists (nested), `bq.` and `{quote}` quotes, `{code}`/`{noformat}` blocks (with language), `||header||`/`|cell|` tables, `----`, `*bold*`, `{{monospace}}`, `[text|url]`, `[url]` and `[~user]`; `{color}` tags are removed. Other markup (for example `{panel}`, images and `[text|ISSUE-1]` issue links) stays as written. Content inside code blocks is never converted.
+
+  Unknown placeholders remain literal, and an empty template produces an empty description. Inserted Jira text is never interpreted as a template. Changing the template updates descriptions still managed by the source; manual card edits remain preserved. The original Jira description supports self-hosted Jira strings and Cloud ADF text, paragraphs, and text hyperlinks. Comment bodies use the same text conversion. ADF images, attachments, and layout are not imported.
 - Jira site + issue ID forms a stable identifier, so renaming a ticket key does not create a new card.
-- Each sync queries the full JQL result with POST search requests (JQL in the JSON body, so long JQL is not limited by URL length) in pages of 50, up to 100 pages and 2,000 cards. Failures do not return partial updates.
+- Each sync queries the full JQL result with POST search requests (JQL in the JSON body, so long JQL is not limited by URL length) in pages of 50 (20 when `{comments}` is used), up to 100 pages and 2,000 cards. Failures do not return partial updates.
 - Self-hosted JQL without `ORDER BY` gets `ORDER BY key ASC` appended, so offset pagination does not skip tickets updated during a sync.
-- Fields beyond Cardbe limits are truncated at a UTF-8 boundary: titles to 4,096 bytes, descriptions to 262,144 bytes, version labels to 256 bytes and 100 labels (`FIELDS_TRUNCATED`). Status names over 64 bytes fail with `STATUS_NAME_TOO_LONG` because they become column names. A missing or `null` `fixVersions` field (hidden in some projects) imports no labels.
-- Tickets that no longer match the JQL or have been deleted remain on the board: this plugin upserts tickets and does not archive or delete omitted tickets. Cardbe also preserves manual overrides, so manually moved cards may stop following Jira statuses.
+- Fields beyond Cardbe limits are truncated at a UTF-8 boundary: titles to 4,096 bytes, descriptions to 262,144 bytes, version labels to 256 bytes and 100 labels (`FIELDS_TRUNCATED`). Status names over 64 bytes fail with `STATUS_NAME_TOO_LONG` because they become column names. A missing or `null` `fixVersions` or `versions` (affects versions) field, hidden in some projects, imports no version tags.
+- Tickets that no longer match the JQL or have been deleted remain on the board by default: the plugin upserts tickets and does not archive omitted ones. Enable `archive_missing` to archive them (see below). Cardbe also preserves manual overrides, so manually moved cards may stop following Jira statuses.
 - Cardbe manages scheduling. Use one instance per source on each board.
+
+### Archiving cards that leave the JQL
+
+With `archive_missing` enabled, each sync also:
+
+1. Restores cards this plugin archived earlier whose ticket matches the JQL again, into the column for the ticket's current status. Jira updates such as a new title apply on the following sync, because archived cards are not updated by the restoring run.
+2. Archives active board cards of this source whose ticket is no longer returned, for example tickets that were closed and filtered out by `status != Closed`, deleted, or moved to another project.
+
+The plugin API does not expose which card belongs to which source, so a card counts as this source's card only when its title starts with a Jira issue key (`APP-123 …`) and its description contains that ticket's link on the configured site (`<site URL>/browse/APP-123`). The default template includes `{url}`; without it nothing can be archived and a warning is logged. Cards whose title or link you edited are never archived, nor are recurring cards.
+
+Safeguards:
+
+- Nothing is archived when the JQL returns no tickets, since Jira answers queries the token cannot see with empty results instead of an error. A failed sync archives nothing.
+- Archive and restore share the run's 200-operation limit with created columns and their upserts; the rest follow on the next sync (`ARCHIVE_DEFERRED`).
+- Only cards archived by this plugin are restored, never cards you archived yourself. Their IDs are kept in the instance cursor (at most 4 KiB, oldest dropped first).
+- If the board listing exceeds the host's query budget, archiving stops for that run with a warning instead of failing the sync.
+- Two instances syncing the same Jira site to one board would archive each other's cards; use one instance per site and board.
+- A ticket whose key changed (moved project) is archived once under its old key's card and restored on the next sync.
 
 ### API 1.3.0 scope
 
-The plugin uses source priority synchronization added in API 1.2.0. API 1.3.0 filtered board queries are available but unnecessary for JQL imports. Waiting relationships accept Cardbe task IDs or create-task keys, not external keys, so Jira issue links are not synchronized. Existing waiting relationships are preserved. Automatic archive/restore and done-column remapping are not enabled: Jira statuses continue to select matching columns.
+The plugin uses source priority synchronization added in API 1.2.0. API 1.3.0 filtered board queries are available but unnecessary for JQL imports. Waiting relationships accept Cardbe task IDs or create-task keys, not external keys, so Jira issue links are not synchronized. Existing waiting relationships are preserved. Archive/restore is opt-in through `archive_missing`; done-column remapping is not enabled, so Jira statuses continue to select matching columns.
 
 ## Logs
 
-Execution emits bounded diagnostic codes and numeric counts: `SYNC_STARTED`, `BOARD_COLUMNS_READ`, `HTTP_REQUESTS`, `HTTP_RESPONSES`, `HTTP_RETRIES`, `FIELDS_TRUNCATED`, `HTTP_LAST_STATUS`, `TICKETS_SYNCED`, `COLUMNS_CREATED`, and `SYNC_COMPLETED`. Request counters and the last received status are also emitted when synchronization fails, together with `SYNC_FAILED` and the specific error code. JSON decoding failures emit `RESPONSE_JSON_ERROR_LINE` and `RESPONSE_JSON_ERROR_COLUMN`. At most a small fixed number of logs is emitted, even across 100 pages.
+Execution emits bounded diagnostic codes and numeric counts: `SYNC_STARTED`, `BOARD_COLUMNS_READ`, `HTTP_REQUESTS`, `HTTP_RESPONSES`, `HTTP_RETRIES`, `FIELDS_TRUNCATED`, `HTTP_LAST_STATUS`, `TICKETS_SYNCED`, `TICKETS_ARCHIVED`, `TICKETS_RESTORED`, `ARCHIVE_DEFERRED`, `COLUMNS_CREATED`, and `SYNC_COMPLETED`. Request counters and the last received status are also emitted when synchronization fails, together with `SYNC_FAILED` and the specific error code. JSON decoding failures emit `RESPONSE_JSON_ERROR_LINE` and `RESPONSE_JSON_ERROR_COLUMN`. At most a small fixed number of logs is emitted, even across 100 pages.
 
 With API 1.1.0 the plugin also writes short text messages (`log-message`): a success summary, a warning per network retry, the unexpected HTTP status, the JSON error position, the host's safe failure code and a hint for each error code. Messages contain only counts, statuses, positions and fixed text. No URLs, JQL, pagination tokens, response bodies, ticket text, or credentials are logged, and serde error text (which can quote response content) is never forwarded.
 
@@ -99,6 +132,8 @@ Version 1.1.0 replaces several generic error codes with the specific codes above
 | `HTTP_FAILED` (network failures) | `NETWORK_FAILED`, after automatic retries |
 
 The old codes remain declared in `error_codes` for compatibility but are no longer returned.
+
+Plugin 1.3.0 adds opt-in archiving of cards that leave the JQL (`archive_missing`), assignee, creator, Jira label and `affects:` version tags, renames fix version tags to `fix:<version>` (existing cards are retagged on their next sync), the `{comments}` and `{description_code}` placeholders and converts self-hosted Jira wiki markup in `{description}` to Markdown. Self-hosted instances using `{description}` get Markdown descriptions on their next sync (manually edited descriptions are preserved). The default template and API version are unchanged.
 
 Plugin 1.2.0 targets Cardbe Plugin API 1.3.0 (`api_version` `1.3.0`) and requires a Cardbe host supporting API 1.3.0. Base URLs may now include a port, for example `https://jira.example.com:8443/jira`. Site URLs are now normalized (lowercase hostname, no `:443`); if an existing instance's site URL used uppercase letters or an explicit `:443`, its cards get new identities and are imported again once.
 
